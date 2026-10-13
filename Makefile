@@ -60,7 +60,8 @@ CFLAGS	+=	$(INCLUDE) -D__SWITCH__
 CXXFLAGS	:= $(CFLAGS)
 
 ASFLAGS	:=	-g $(ARCH)
-LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map) \
+			-Wl,--wrap=envIsSyscallHinted
 
 # Prefer a mounted custom Mesa build when present.
 # Example:

@@ -20,8 +20,25 @@
 #include "imports.h"
 #include "zip_fs.h"
 
+// libnx defaults to 8 MiB of nvidia transfer memory; Mesa/Nouveau ran out of it
+// during area transitions (LibnxNvidiaError_SharedMemoryTooSmall, black screens)
+u32 __nx_nv_transfermem_size = 0x2000000;
+
+// hbloader hints svcInvalidateProcessDataCache (0x5D) as available, but under
+// title takeover the kernel rejects it (BadSVC). Mesa 26 calls it from
+// glReadPixels when hinted, so report it unavailable and let Mesa use its
+// armDCacheFlush fallback.
+bool __real_envIsSyscallHinted(unsigned svc);
+bool __wrap_envIsSyscallHinted(unsigned svc)
+{
+  if (svc == 0x5D)
+    return false;
+  return __real_envIsSyscallHinted(svc);
+}
+
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
+static size_t heap_newlib_size = 0;
 
 // provide replacement heap init function to separate newlib heap from the .so
 void __libnx_initheap(void)
@@ -48,10 +65,16 @@ void __libnx_initheap(void)
       diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed));
   }
 
-  // only allocate a fixed amount for the newlib heap
+  // give newlib everything except a fixed reserve for the .so image; the game,
+  // Mesa and OpenAL all allocate from the newlib heap
   extern char *fake_heap_start;
   extern char *fake_heap_end;
-  fake_heap_size = umin(size, MEMORY_MB * 1024 * 1024);
+  const size_t so_reserve = (size_t)SO_HEAP_RESERVE_MB * 1024 * 1024;
+  if (size > so_reserve + (size_t)MEMORY_MB * 1024 * 1024)
+    fake_heap_size = (size - so_reserve) & ~0xFFFUL;
+  else
+    fake_heap_size = umin(size, MEMORY_MB * 1024 * 1024);
+  heap_newlib_size = fake_heap_size;
   fake_heap_start = (char *)addr;
   fake_heap_end = (char *)addr + fake_heap_size;
 
@@ -93,26 +116,18 @@ static void check_syscalls(void)
   if (!envIsSyscallHinted(0x73))
     fatal_error("svcSetProcessMemoryPermission is unavailable.");
   if (envGetOwnProcessHandle() == INVALID_HANDLE)
-    fatal_error("Own process handle is unavailable.\nTitle Takeover required:\n1. Install a game in Ryujinx\n2. Hold R while launching it\n3. Select bully_nx.nro from Hbmenu");
+    fatal_error("Own process handle is unavailable.\nTitle Takeover required:\n1. Hold R while launching an installed game\n2. Select bully_nx.nro from Hbmenu");
 }
 
 static void set_screen_size(int w, int h)
 {
   if (w <= 0 || h <= 0 || w > 1920 || h > 1080)
   {
-    // auto; prefer 720p on both handheld and docked.
-    // Full 1080p docked works, but it drives GPU load unnecessarily high for
-    // this Android wrapper and leaves little headroom for the heavier scenes.
-    if (appletGetOperationMode() == AppletOperationMode_Console)
-    {
-      screen_width = 960;
-      screen_height = 540;
-    }
-    else
-    {
-      screen_width = 960;
-      screen_height = 540;
-    }
+    // auto; 960x540 on both handheld and docked.
+    // 720p/1080p docked work, but they drive GPU load high enough for this
+    // Android wrapper to drop frames in the heavier scenes.
+    screen_width = 960;
+    screen_height = 540;
   }
   else
   {
@@ -130,10 +145,16 @@ int main(void)
   if (read_config(CONFIG_NAME) < 0)
     write_config(CONFIG_NAME);
 
+  debugPrintf_setFileLog(config.debug_log);
+
+  // 0 = auto (starts at 0 ms), < 0 = disabled, > 0 = fixed delay
   compat_delay_ms = config.timing_workaround_ms;
   if (compat_delay_ms < 0)
     compat_delay_ms = 0;
   debugPrintf_setCompatDelayMs(compat_delay_ms);
+
+  extern void openal_write_config(void);
+  openal_write_config();
 
   zip_fs_init();
 
@@ -143,9 +164,9 @@ int main(void)
   // calculate actual screen size
   set_screen_size(config.screen_width, config.screen_height);
 
-  debugPrintf("heap size = %u KB\n", MEMORY_MB * 1024);
+  debugPrintf("heap size = %zu KB\n", heap_newlib_size / 1024);
   debugPrintf(" lib base = %p\n", heap_so_base);
-  debugPrintf("  lib max = %u KB\n", heap_so_limit / 1024);
+  debugPrintf("  lib max = %zu KB\n", heap_so_limit / 1024);
 
   // Load libc++_shared.so first — provides __ndk1 C++ stdlib symbols
   extern int cpplib_load(const char *filename);

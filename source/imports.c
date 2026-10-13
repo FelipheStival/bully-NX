@@ -1278,15 +1278,17 @@ static int g_egl_swap_count = 0;
 void glClear_wrapper(GLbitfield mask)
 {
   gl_clear_count++;
-  if (gl_clear_count <= 5 || (gl_clear_count % 500 == 0))
+  if (debugPrintf_enabled() && (gl_clear_count <= 5 || (gl_clear_count % 500 == 0)))
     debugPrintf("glClear: mask=0x%x (call #%d)\n", mask, gl_clear_count);
   glClear(mask);
+  if (gl_clear_count <= 3 && debugPrintf_enabled())
+    debugPrintf("glClear: returned (call #%d) err=0x%x\n", gl_clear_count, glGetError());
 }
 
 void glViewport_wrapper(GLint x, GLint y, GLsizei w, GLsizei h)
 {
   gl_viewport_count++;
-  if (gl_viewport_count <= 5 || (gl_viewport_count % 500 == 0))
+  if (debugPrintf_enabled() && (gl_viewport_count <= 5 || (gl_viewport_count % 500 == 0)))
     debugPrintf("glViewport: %d,%d %dx%d (call #%d)\n", x, y, w, h, gl_viewport_count);
   glViewport(x, y, w, h);
 }
@@ -1294,7 +1296,7 @@ void glViewport_wrapper(GLint x, GLint y, GLsizei w, GLsizei h)
 void glDrawElements_wrapper(GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
   gl_draw_count++;
-  if (gl_draw_count <= 5 || (gl_draw_count % 500 == 0))
+  if (debugPrintf_enabled() && (gl_draw_count <= 5 || (gl_draw_count % 500 == 0)))
     debugPrintf("glDrawElements: mode=0x%x count=%d (call #%d)\n", mode, count, gl_draw_count);
   glDrawElements(mode, count, type, indices);
 }
@@ -1302,7 +1304,7 @@ void glDrawElements_wrapper(GLenum mode, GLsizei count, GLenum type, const void 
 void glDrawArrays_wrapper(GLenum mode, GLint first, GLsizei count)
 {
   gl_draw_count++;
-  if (gl_draw_count <= 5 || (gl_draw_count % 500 == 0))
+  if (debugPrintf_enabled() && (gl_draw_count <= 5 || (gl_draw_count % 500 == 0)))
     debugPrintf("glDrawArrays: mode=0x%x first=%d count=%d (call #%d)\n", mode, first, count, gl_draw_count);
   glDrawArrays(mode, first, count);
 }
@@ -1330,10 +1332,13 @@ EGLBoolean eglSwapBuffers_wrapper(EGLDisplay dpy, EGLSurface surface)
   EGLBoolean ok;
 
   egl_call_lock();
-  if (g_egl_swap_count < 5 || (g_egl_swap_count % 300 == 0))
+  if (debugPrintf_enabled() && (g_egl_swap_count < 5 || (g_egl_swap_count % 300 == 0)))
     debugPrintf("eglSwapBuffers_wrapper: swap #%d\n", g_egl_swap_count);
   g_egl_swap_count++;
   ok = eglSwapBuffers(g_egl_display, g_egl_surface);
+  if (g_egl_swap_count <= 3 && debugPrintf_enabled())
+    debugPrintf("eglSwapBuffers_wrapper: swap #%d returned %d err=0x%x\n",
+                g_egl_swap_count - 1, ok, eglGetError());
   egl_call_unlock();
   return ok;
 }
@@ -1599,34 +1604,36 @@ void __assert2(const char *file, int line, const char *func, const char *expr)
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...)
 {
-#ifdef DEBUG_LOG
-  va_list list;
-  static char string[0x1000];
+  if (debugPrintf_enabled())
+  {
+    va_list list;
+    char string[0x1000];
 
-  va_start(list, fmt);
-  debugPrintf("__android_log_print: tag=%s, fmt=%s\n", tag, fmt);
-  vsnprintf(string, sizeof(string), fmt, list);
-  va_end(list);
+    va_start(list, fmt);
+    debugPrintf("__android_log_print: tag=%s, fmt=%s\n", tag, fmt);
+    vsnprintf(string, sizeof(string), fmt, list);
+    va_end(list);
 
-  debugPrintf("%s: %s\n", tag, string);
-#endif
+    debugPrintf("%s: %s\n", tag, string);
+  }
   return 0;
 }
 
 int fake_fprintf(FILE *stream, const char *fmt, ...)
 {
   int ret = 0;
-#ifdef DEBUG_LOG
-  va_list list;
-  static char string[0x1000];
+  if (debugPrintf_enabled())
+  {
+    va_list list;
+    char string[0x1000];
 
-  va_start(list, fmt);
-  debugPrintf("fake_fprintf: %s\n", fmt);
-  ret = vsnprintf(string, sizeof(string), fmt, list);
-  va_end(list);
+    va_start(list, fmt);
+    debugPrintf("fake_fprintf: %s\n", fmt);
+    ret = vsnprintf(string, sizeof(string), fmt, list);
+    va_end(list);
 
-  debugPrintf("%s", string);
-#endif
+    debugPrintf("%s", string);
+  }
   return ret;
 }
 
@@ -1845,7 +1852,7 @@ int pthread_cond_signal_fake(pthread_cond_t **cnd)
   if (!c)
     return -1;
   int n = __atomic_add_fetch(&g_cond_signal_count, 1, __ATOMIC_RELAXED);
-  if (n <= 20 || (n % 200 == 0))
+  if (debugPrintf_enabled() && (n <= 20 || (n % 200 == 0)))
     debugPrintf("pthread_cond_signal: cnd=%p (call #%d)\n", (void *)c, n);
   return pthread_cond_signal(c);
 }
@@ -1872,7 +1879,7 @@ int pthread_cond_wait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx)
   if (!c || !m)
     return -1;
   int n = __atomic_add_fetch(&g_cond_wait_count, 1, __ATOMIC_RELAXED);
-  if (n <= 20 || (n % 200 == 0))
+  if (debugPrintf_enabled() && (n <= 20 || (n % 200 == 0)))
     debugPrintf("pthread_cond_wait: cnd=%p mtx=%p (call #%d)\n", (void *)c, (void *)m, n);
   return pthread_cond_wait(c, m);
 }
@@ -1944,9 +1951,173 @@ static void *pthread_entry_wrapper(void *data)
 int pthread_create_fake(pthread_t *thread, const void *unused, void *entry, void *arg)
 {
   PthreadWrapperData *pd = malloc(sizeof(PthreadWrapperData));
+  pthread_attr_t attr;
+  int rc;
+
+  if (!pd)
+    return -1;
   pd->func = (void *(*)(void *))entry;
   pd->arg = arg;
-  return pthread_create(thread, NULL, pthread_entry_wrapper, pd);
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, GAME_THREAD_STACK_SIZE);
+  rc = pthread_create(thread, &attr, pthread_entry_wrapper, pd);
+  pthread_attr_destroy(&attr);
+  if (rc != 0)
+    free(pd);
+  return rc;
+}
+
+// ---------------------------------------------------------------------------
+// GL call tracing (debug_log 1 only). Each traced call is logged *before* it
+// runs, so the last line of debug.log names the call that crashed or hung.
+// The wrappers chain to whatever the import table held (real GL or a hook).
+// ---------------------------------------------------------------------------
+#define GL_TRACE_LIMIT 48
+
+extern DynLibFunction dynlib_functions[];
+extern size_t dynlib_numfunctions;
+
+#define GL_TRACE_BEGIN(fn, fmt, ...)                                           \
+  do                                                                           \
+  {                                                                            \
+    static int calls;                                                          \
+    if (calls < GL_TRACE_LIMIT)                                                \
+    {                                                                          \
+      calls++;                                                                 \
+      debugPrintf("gltrace: " #fn "(" fmt ") #%d\n", __VA_ARGS__, calls);      \
+    }                                                                          \
+  } while (0)
+
+static void (*real_glCompressedTexImage2D)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *);
+static void (*real_glTexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+static void (*real_glTexStorage2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+static void (*real_glTexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *);
+static void (*real_glCompileShader)(GLuint);
+static void (*real_glLinkProgram)(GLuint);
+static void (*real_glUseProgram)(GLuint);
+static void (*real_glBindFramebuffer)(GLenum, GLuint);
+static void (*real_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+static GLenum (*real_glCheckFramebufferStatus)(GLenum);
+static void (*real_glRenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
+static void (*real_glBufferData)(GLenum, GLsizeiptr, const void *, GLenum);
+static void (*real_glReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+static void (*real_glFinish)(void);
+
+static void trace_glCompressedTexImage2D(GLenum target, GLint level, GLenum format, GLsizei w, GLsizei h, GLint border, GLsizei size, const void *data)
+{
+  GL_TRACE_BEGIN(glCompressedTexImage2D, "lvl=%d fmt=0x%x %dx%d size=%d", level, format, w, h, size);
+  real_glCompressedTexImage2D(target, level, format, w, h, border, size, data);
+}
+
+static void trace_glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint border, GLenum format, GLenum type, const void *data)
+{
+  GL_TRACE_BEGIN(glTexImage2D, "lvl=%d ifmt=0x%x %dx%d fmt=0x%x type=0x%x", level, ifmt, w, h, format, type);
+  real_glTexImage2D(target, level, ifmt, w, h, border, format, type, data);
+}
+
+static void trace_glTexStorage2D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h)
+{
+  GL_TRACE_BEGIN(glTexStorage2D, "levels=%d ifmt=0x%x %dx%d", levels, ifmt, w, h);
+  real_glTexStorage2D(target, levels, ifmt, w, h);
+}
+
+static void trace_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, const void *data)
+{
+  GL_TRACE_BEGIN(glTexSubImage2D, "lvl=%d %d,%d %dx%d fmt=0x%x type=0x%x", level, x, y, w, h, format, type);
+  real_glTexSubImage2D(target, level, x, y, w, h, format, type, data);
+}
+
+static void trace_glCompileShader(GLuint shader)
+{
+  GL_TRACE_BEGIN(glCompileShader, "%u", shader);
+  real_glCompileShader(shader);
+}
+
+static void trace_glLinkProgram(GLuint program)
+{
+  GL_TRACE_BEGIN(glLinkProgram, "%u", program);
+  real_glLinkProgram(program);
+}
+
+static void trace_glUseProgram(GLuint program)
+{
+  GL_TRACE_BEGIN(glUseProgram, "%u", program);
+  real_glUseProgram(program);
+}
+
+static void trace_glBindFramebuffer(GLenum target, GLuint fb)
+{
+  GL_TRACE_BEGIN(glBindFramebuffer, "0x%x, %u", target, fb);
+  real_glBindFramebuffer(target, fb);
+}
+
+static void trace_glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint tex, GLint level)
+{
+  GL_TRACE_BEGIN(glFramebufferTexture2D, "att=0x%x tex=%u lvl=%d", attachment, tex, level);
+  real_glFramebufferTexture2D(target, attachment, textarget, tex, level);
+}
+
+static GLenum trace_glCheckFramebufferStatus(GLenum target)
+{
+  GLenum ret;
+  GL_TRACE_BEGIN(glCheckFramebufferStatus, "0x%x", target);
+  ret = real_glCheckFramebufferStatus(target);
+  if (ret != GL_FRAMEBUFFER_COMPLETE && debugPrintf_enabled())
+    debugPrintf("gltrace: glCheckFramebufferStatus -> 0x%x (incomplete)\n", ret);
+  return ret;
+}
+
+static void trace_glRenderbufferStorage(GLenum target, GLenum ifmt, GLsizei w, GLsizei h)
+{
+  GL_TRACE_BEGIN(glRenderbufferStorage, "ifmt=0x%x %dx%d", ifmt, w, h);
+  real_glRenderbufferStorage(target, ifmt, w, h);
+}
+
+static void trace_glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage)
+{
+  GL_TRACE_BEGIN(glBufferData, "0x%x size=%ld usage=0x%x", target, (long)size, usage);
+  real_glBufferData(target, size, data, usage);
+}
+
+static void trace_glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void *pixels)
+{
+  GL_TRACE_BEGIN(glReadPixels, "%d,%d %dx%d fmt=0x%x type=0x%x", x, y, w, h, format, type);
+  real_glReadPixels(x, y, w, h, format, type, pixels);
+}
+
+static void trace_glFinish(void)
+{
+  GL_TRACE_BEGIN(glFinish, "%s", "");
+  real_glFinish();
+}
+
+#define GL_TRACE_INSTALL(name)                                                 \
+  do                                                                           \
+  {                                                                            \
+    DynLibFunction *f = so_find_import(dynlib_functions, dynlib_numfunctions, #name); \
+    if (f)                                                                     \
+    {                                                                          \
+      real_##name = (void *)f->func;                                           \
+      f->func = (uintptr_t)&trace_##name;                                      \
+    }                                                                          \
+  } while (0)
+
+static void install_gl_trace(void)
+{
+  GL_TRACE_INSTALL(glCompressedTexImage2D);
+  GL_TRACE_INSTALL(glTexImage2D);
+  GL_TRACE_INSTALL(glTexStorage2D);
+  GL_TRACE_INSTALL(glTexSubImage2D);
+  GL_TRACE_INSTALL(glCompileShader);
+  GL_TRACE_INSTALL(glLinkProgram);
+  GL_TRACE_INSTALL(glUseProgram);
+  GL_TRACE_INSTALL(glBindFramebuffer);
+  GL_TRACE_INSTALL(glFramebufferTexture2D);
+  GL_TRACE_INSTALL(glCheckFramebufferStatus);
+  GL_TRACE_INSTALL(glRenderbufferStorage);
+  GL_TRACE_INSTALL(glBufferData);
+  GL_TRACE_INSTALL(glReadPixels);
+  GL_TRACE_INSTALL(glFinish);
 }
 
 // GL stuff
@@ -1964,12 +2135,33 @@ void glCompressedTexImage2DHook(GLenum target, GLint level, GLenum format, GLsiz
     glCompressedTexImage2D(target, level, format, width, height, border, imageSize, data);
 }
 
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
+#endif
+
+static int g_anisotropy_supported = -1;
+
 void glTexParameteriHook(GLenum target, GLenum param, GLint val)
 {
   // force trilinear filtering instead of bilinear+nearest mipmap
-  if (val == GL_LINEAR_MIPMAP_NEAREST)
+  if (config.trilinear_filter && val == GL_LINEAR_MIPMAP_NEAREST)
     val = GL_LINEAR_MIPMAP_LINEAR;
   glTexParameteri(target, param, val);
+
+  // anisotropic filtering keeps ground and wall textures sharp at grazing
+  // angles; only mipmapped textures benefit, so key it off their min filter
+  if (config.anisotropy > 1 && param == GL_TEXTURE_MIN_FILTER &&
+      (val == GL_LINEAR_MIPMAP_LINEAR || val == GL_LINEAR_MIPMAP_NEAREST))
+  {
+    if (g_anisotropy_supported < 0)
+    {
+      const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+      g_anisotropy_supported = ext && strstr(ext, "GL_EXT_texture_filter_anisotropic") != NULL;
+    }
+    if (g_anisotropy_supported)
+      glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_EXT,
+                      (GLfloat)(config.anisotropy > 16 ? 16 : config.anisotropy));
+  }
 }
 
 // fopen wrapper to trace all file opens from the game
@@ -1980,7 +2172,8 @@ FILE *fopen_wrapper(const char *path, const char *mode)
   if (!f && path && mode && mode[0] == 'r')
     f = zip_fs_fopen(path);
   fopen_count++;
-  debugPrintf("fopen: \"%s\" mode=%s -> %p (#%d)\n", path ? path : "(null)", mode ? mode : "?", f, fopen_count);
+  if (debugPrintf_enabled())
+    debugPrintf("fopen: \"%s\" mode=%s -> %p (#%d)\n", path ? path : "(null)", mode ? mode : "?", f, fopen_count);
   return f;
 }
 
@@ -2007,6 +2200,8 @@ int open_wrapper(const char *path, int flags, ...)
     fd = zip_fs_open(path, flags);
 
   open_count++;
+  if (!debugPrintf_enabled())
+    return fd;
   if (fd < 0)
   {
     debugPrintf("open FAILED: \"%s\" flags=0x%x err=%d (#%d)\n",
@@ -2027,7 +2222,7 @@ static volatile int g_sem_post_count = 0;
 int sem_wait_wrapper(sem_t *sem)
 {
   int n = __atomic_add_fetch(&g_sem_wait_count, 1, __ATOMIC_RELAXED);
-  if (n <= 20 || (n % 200 == 0))
+  if (debugPrintf_enabled() && (n <= 20 || (n % 200 == 0)))
     debugPrintf("sem_wait: sem=%p (call #%d)\n", (void *)sem, n);
   return sem_wait(sem);
 }
@@ -2035,7 +2230,7 @@ int sem_wait_wrapper(sem_t *sem)
 int sem_post_wrapper(sem_t *sem)
 {
   int n = __atomic_add_fetch(&g_sem_post_count, 1, __ATOMIC_RELAXED);
-  if (n <= 20 || (n % 200 == 0))
+  if (debugPrintf_enabled() && (n <= 20 || (n % 200 == 0)))
     debugPrintf("sem_post: sem=%p (call #%d)\n", (void *)sem, n);
   return sem_post(sem);
 }
@@ -2047,7 +2242,7 @@ static volatile int g_syscall_count = 0;
 long syscall_wrapper(long number, ...)
 {
   int n = __atomic_add_fetch(&g_syscall_count, 1, __ATOMIC_RELAXED);
-  if (n <= 50 || (n % 500 == 0))
+  if (debugPrintf_enabled() && (n <= 50 || (n % 500 == 0)))
     debugPrintf("syscall: nr=%ld (call #%d)\n", number, n);
   errno = ENOSYS;
   return -1;
@@ -2080,7 +2275,9 @@ DynLibFunction dynlib_functions[] = {
     {"__cxa_rethrow", (uintptr_t)&__cxa_rethrow},
     {"__cxa_throw", (uintptr_t)&__cxa_throw_wrapper},
     {"__cxa_thread_atexit", (uintptr_t)&__cxa_thread_atexit},
-    {"__dynamic_cast", (uintptr_t)&__dynamic_cast},
+    // __dynamic_cast is intentionally absent: the game's type_info objects come
+    // from the NDK libc++abi, so resolve it from libc++_shared.so instead of
+    // the host libstdc++ (mixing the two crashed in HangOutTrack::Update).
     {"__gxx_personality_v0", (uintptr_t)&__gxx_personality_v0},
     {"__emutls_get_address", (uintptr_t)&__emutls_get_address_stub},
 
@@ -2535,9 +2732,32 @@ size_t dynlib_numfunctions = sizeof(dynlib_functions) / sizeof(*dynlib_functions
 
 void update_imports(void)
 {
+  // the GL trace wrappers only exist for logging; call GL directly otherwise
+  if (!debugPrintf_enabled())
+  {
+    DynLibFunction *f;
+    if ((f = so_find_import(dynlib_functions, dynlib_numfunctions, "glClear")))
+      f->func = (uintptr_t)&glClear;
+    if ((f = so_find_import(dynlib_functions, dynlib_numfunctions, "glViewport")))
+      f->func = (uintptr_t)&glViewport;
+    if ((f = so_find_import(dynlib_functions, dynlib_numfunctions, "glDrawElements")))
+      f->func = (uintptr_t)&glDrawElements;
+    if ((f = so_find_import(dynlib_functions, dynlib_numfunctions, "glCreateShader")))
+      f->func = (uintptr_t)&glCreateShader;
+    if ((f = so_find_import(dynlib_functions, dynlib_numfunctions, "glShaderSource")))
+      f->func = (uintptr_t)&glShaderSource;
+    // glDrawArrays is listed twice in the table
+    for (size_t i = 0; i < dynlib_numfunctions; i++)
+      if (!strcmp(dynlib_functions[i].symbol, "glDrawArrays"))
+        dynlib_functions[i].func = (uintptr_t)&glDrawArrays;
+  }
+
   // only use the hooks if the relevant config options are enabled to avoid possible overhead
   if (config.disable_mipmaps)
     so_find_import(dynlib_functions, dynlib_numfunctions, "glCompressedTexImage2D")->func = (uintptr_t)glCompressedTexImage2DHook;
-  if (config.trilinear_filter)
+  if (config.trilinear_filter || config.anisotropy > 1)
     so_find_import(dynlib_functions, dynlib_numfunctions, "glTexParameteri")->func = (uintptr_t)glTexParameteriHook;
+  // install last so the trace chains to the hooks above
+  if (debugPrintf_enabled())
+    install_gl_trace();
 }

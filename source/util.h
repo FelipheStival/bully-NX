@@ -14,6 +14,12 @@
 int debugPrintf(const char *text, ...);
 void debugPrintf_setMainThread(void);
 void debugPrintf_setCompatDelayMs(int ms);
+void debugPrintf_setFileLog(int enabled);
+int debugPrintf_enabled(void);
+
+// Android threads get ~1 MiB of stack; libnx pthreads default to 128 KiB, which
+// is too small for the engine plus Mesa's shader compiler on the render thread.
+#define GAME_THREAD_STACK_SIZE (1024 * 1024)
 
 int ret0(void);
 int ret1(void);

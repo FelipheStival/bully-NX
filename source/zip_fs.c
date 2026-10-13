@@ -151,7 +151,8 @@ FILE *zip_fs_fopen(const char *path)
       return NULL;
     }
 
-    debugPrintf("zip_fs: served \"%s\" (%u bytes) from data_%d.zip\n",
+    if (debugPrintf_enabled())
+      debugPrintf("zip_fs: served \"%s\" (%u bytes) from data_%d.zip\n",
                 lookup, (unsigned)info.uncompressed_size, i);
     return f;
   }

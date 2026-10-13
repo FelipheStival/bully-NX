@@ -20,7 +20,16 @@
   CONFIG_VAR_INT(shadows);                                                     \
   CONFIG_VAR_INT(trilinear_filter);                                            \
   CONFIG_VAR_INT(disable_mipmaps);                                             \
+  CONFIG_VAR_INT(nintendo_button_glyphs);                                      \
   CONFIG_VAR_INT(timing_workaround_ms);                                        \
+  CONFIG_VAR_INT(debug_log);                                                   \
+  CONFIG_VAR_INT(shader_cache);                                                \
+  CONFIG_VAR_INT(cpu_boost);                                                   \
+  CONFIG_VAR_INT(gl_thread);                                                   \
+  CONFIG_VAR_INT(audio_quality);                                               \
+  CONFIG_VAR_INT(phone_mode);                                                  \
+  CONFIG_VAR_INT(anisotropy);                                                  \
+  CONFIG_VAR_STR(gl_driver);                                                   \
   CONFIG_VAR_STR(mod_file);
 
 Config config;
@@ -58,10 +67,19 @@ int read_config(const char *file) {
   config.screen_width = -1; // auto
   config.screen_height = -1;
   config.clarity = 0; // Low
-  config.shadows = 0; // Low
+  config.shadows = 0; // Off
   config.trilinear_filter = 0;
   config.disable_mipmaps = 0;
+  config.nintendo_button_glyphs = 1;
   config.timing_workaround_ms = 0; // auto
+  config.debug_log = 0;
+  config.shader_cache = 1;
+  config.cpu_boost = 0;
+  config.gl_thread = 0;
+  config.audio_quality = 1;
+  config.phone_mode = 1;
+  config.anisotropy = 4;
+  strlcpy(config.gl_driver, "nvc0", sizeof(config.gl_driver));
 
   FILE *f = fopen(file, "r");
   if (f == NULL)

@@ -137,13 +137,6 @@ static void *BullySettings_Load_impl(void *this_ptr)
   return fn(this_ptr);
 }
 
-static int BullySettings_GetMaxShadowOption_impl(void *this_ptr)
-{
-  int (*fn)(void *) =
-      (int (*)(void *))((uintptr_t)text_virtbase + BULLY_SETTINGS_GET_MAX_SHADOW_OPTION_IMPL_OFFSET);
-  return fn(this_ptr);
-}
-
 static void BullySettings_ApplyConfig(void *this_ptr)
 {
   BullySettingsConfigLayout *settings = (BullySettingsConfigLayout *)this_ptr;
@@ -165,11 +158,9 @@ static void BullySettings_ApplyConfig(void *this_ptr)
   shadows = config.shadows;
   if (shadows < 0)
     shadows = 0;
-  {
-    int max_shadow = BullySettings_GetMaxShadowOption_impl(this_ptr);
-    if (max_shadow >= 0 && shadows > max_shadow)
-      shadows = max_shadow;
-  }
+  if (shadows > 3)
+    shadows = 3;
+  debugPrintf("BullySettings: shadows config=%d -> %d\n", config.shadows, shadows);
   shadow_profile = shadows > 0 ? shadows + 1 : 0;
 
   // Native ResolutionSetting is ordered High/Med/Low in this build, while the
@@ -1540,14 +1531,17 @@ void OS_PlaylistSetVolume_hook(float vol) {}
 // "isPhone") which re-enters the hook through the patched GOT, causing infinite
 // recursion. We write the isPhone flag directly at the known .bss offset.
 void AND_SystemInitialize_hook(void *env, void *activity) {
-  debugPrintf("AND_SystemInitialize_hook: stubbed (setting isPhone=1)\n");
+  // phone_mode 0 reports a tablet, which unlocks the native desktop-class
+  // effects (and the shadow pass that is gated on the device class).
+  const uint32_t is_phone = config.phone_mode ? 1 : 0;
+  debugPrintf("AND_SystemInitialize_hook: stubbed (setting isPhone=%u)\n", is_phone);
   // After so_finalize(), text_base is inaccessible (unmapped by
   // svcMapProcessCodeMemory). text_virtbase is the runtime mapping base.
   // Data/BSS past text_asize is RW.
   extern void *text_virtbase;
   volatile uint32_t *isPhone =
       (volatile uint32_t *)((uintptr_t)text_virtbase + ISPHONE_FLAG_OFFSET);
-  *isPhone = 1;
+  *isPhone = is_phone;
   debugPrintf("AND_SystemInitialize_hook: isPhone flag set at %p\n",
               (void *)isPhone);
 }
@@ -1595,7 +1589,7 @@ void OS_ThreadUnmakeCurrent_hook(void) {
 // On Switch those globals are NULL. Hook to use our known-good EGL handles.
 static int g_swap_count = 0;
 void OS_ScreenSwapBuffers_hook(void) {
-  if (g_swap_count < 5 || (g_swap_count % 300 == 0))
+  if (debugPrintf_enabled() && (g_swap_count < 5 || (g_swap_count % 300 == 0)))
     debugPrintf("OS_ScreenSwapBuffers_hook: swap #%d\n", g_swap_count);
   g_swap_count++;
   eglSwapBuffers(g_egl_display, g_egl_surface);
@@ -1626,7 +1620,41 @@ typedef struct {
   void *arg;
   char *handle;
   int is_gamemain;
+  char name[32];
 } OsThreadData;
+
+// Spread the engine threads over the cores like the Vita port does instead of
+// leaving them all on the process default core (core 0). The full process core
+// mask is kept so the kernel can still migrate them when a core is idle.
+static void os_thread_set_ideal_core(const char *name) {
+  static const struct {
+    const char *name;
+    s32 core;
+  } core_map[] = {
+      {"GameMain", 0},
+      {"RenderThread", 1},
+      {"CDStreamThread", 2},
+      {"Sound", 2},
+  };
+  u64 core_mask = 0;
+  size_t i;
+
+  if (R_FAILED(svcGetInfo(&core_mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)))
+    return;
+
+  for (i = 0; i < sizeof(core_map) / sizeof(core_map[0]); i++) {
+    Result rc;
+
+    if (strcmp(name, core_map[i].name) != 0)
+      continue;
+    if (!(core_mask & (1ULL << core_map[i].core)))
+      return;
+    rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core_map[i].core, (u32)core_mask);
+    debugPrintf("os_thread_entry: '%s' ideal core %d (mask %#llx) rc=%#x\n", name,
+                core_map[i].core, (unsigned long long)core_mask, rc);
+    return;
+  }
+}
 
 volatile int g_gamemain_alive = 0; // 0=not started, 1=running, 2=returned
 
@@ -1641,7 +1669,11 @@ static void *os_thread_entry(void *data) {
   void *arg = td->arg;
   char *handle = td->handle;
   int is_gamemain = td->is_gamemain;
+  char name[32];
+  memcpy(name, td->name, sizeof(name));
   free(td);
+
+  os_thread_set_ideal_core(name);
 
   uint8_t *tls = calloc(1, 0x200);
   armSetTlsRw(tls);
@@ -1692,9 +1724,14 @@ void *OS_ThreadLaunch(int (*func)(void *), void *arg, int r2, char *name,
   td->arg = arg;
   td->handle = handle;
   td->is_gamemain = (name && strcmp(name, "GameMain") == 0);
+  snprintf(td->name, sizeof(td->name), "%s", name ? name : "");
 
   pthread_t thrd;
-  int rc = pthread_create(&thrd, NULL, os_thread_entry, td);
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, GAME_THREAD_STACK_SIZE);
+  int rc = pthread_create(&thrd, &attr, os_thread_entry, td);
+  pthread_attr_destroy(&attr);
   if (rc != 0) {
     debugPrintf("OS_ThreadLaunch: pthread_create failed (%d)\n", rc);
     free(td);
@@ -1875,6 +1912,8 @@ float WarGamepad_GetGamepadAxis(int padnum, int axis) {
 // Hook game's own debug output so we see what the engine prints
 void OS_DebugOutFmt_hook(const char *fmt, ...) {
   char buf[1024];
+  if (!debugPrintf_enabled())
+    return;
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -1884,6 +1923,8 @@ void OS_DebugOutFmt_hook(const char *fmt, ...) {
 
 void OS_DebugOutFmtForce_hook(const char *fmt, ...) {
   char buf[1024];
+  if (!debugPrintf_enabled())
+    return;
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -1892,11 +1933,45 @@ void OS_DebugOutFmtForce_hook(const char *fmt, ...) {
 }
 
 void OS_DebugOut_hook(const char *msg) {
-  debugPrintf("OS_DebugOut: %s\n", msg ? msg : "(null)");
+  if (debugPrintf_enabled())
+    debugPrintf("OS_DebugOut: %s\n", msg ? msg : "(null)");
 }
 
+// CPU boost (1785 MHz) while a loading screen is reading files. FastLoad also
+// drops the GPU clock, so it is released as soon as loading goes quiet.
+#define LOADING_BOOST_HOLD_NS 750000000ULL
+static volatile u64 g_loading_boost_last_ns;
+static int g_loading_boost_active;
+static int g_loading_boost_failed;
+
 void LoadingScreenLoadingFile_hook(const char *path) {
-  debugPrintf("LoadingScreenLoadingFile: %s\n", path ? path : "(null)");
+  if (config.cpu_boost && !g_loading_boost_failed)
+    g_loading_boost_last_ns = armTicksToNs(armGetSystemTick());
+  if (debugPrintf_enabled())
+    debugPrintf("LoadingScreenLoadingFile: %s\n", path ? path : "(null)");
+}
+
+// called once per frame from the main loop
+void loading_boost_update(void) {
+  const u64 last = g_loading_boost_last_ns;
+  const int want = last && armTicksToNs(armGetSystemTick()) - last < LOADING_BOOST_HOLD_NS;
+
+  if (want == g_loading_boost_active)
+    return;
+  if (R_SUCCEEDED(appletSetCpuBoostMode(want ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal)))
+  {
+    g_loading_boost_active = want;
+    return;
+  }
+  // Leaving FastLoad keeps being retried every frame: staying in it would pin
+  // the GPU at its minimum clock. Failing to enter it means it is unsupported
+  // here, so stop asking (each attempt is an applet IPC).
+  if (want)
+  {
+    debugPrintf("loading boost: appletSetCpuBoostMode failed, disabling\n");
+    g_loading_boost_failed = 1;
+    g_loading_boost_last_ns = 0;
+  }
 }
 
 // ============================================================================
@@ -2006,6 +2081,16 @@ void patch_game(void) {
              (uintptr_t)BullySettings_ResetDisplay_hook);
   hook_arm64((uintptr_t)text_base + BULLY_SETTINGS_LOAD_PLT_OFFSET,
              (uintptr_t)BullySettings_Load_hook);
+  {
+    // The native shadow cap is derived from the device class, and isPhone=1
+    // caps it to Off wherever the game checks it; lift it and let
+    // config.shadows decide. Patched in place as `mov w0, #3; ret` (8 bytes)
+    // because a 16-byte trampoline could run past a short getter.
+    uint32_t *max_shadow =
+        (uint32_t *)((uintptr_t)text_base + BULLY_SETTINGS_GET_MAX_SHADOW_OPTION_IMPL_OFFSET);
+    max_shadow[0] = 0x52800060u; // mov w0, #3
+    max_shadow[1] = 0xd65f03c0u; // ret
+  }
 
   // --- SYMBOLS BELOW DO NOT EXIST IN 64-BIT libGame.so ---
   // hook_arm64(so_find_addr("_Z20OS_ServiceAppCommandPKcS0_"),

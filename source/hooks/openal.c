@@ -19,6 +19,10 @@
 #include <AL/alext.h>
 #include <AL/efx.h>
 
+// audout runs at 48 kHz
+#define AL_MIX_FREQUENCY 48000
+
+#include "../config.h"
 #include "../util.h"
 #include "../so_util.h"
 
@@ -196,7 +200,7 @@ void openal_set_runtime_enabled(int enabled)
 
   if (!al_ctx)
   {
-    const ALCint attr[] = { ALC_FREQUENCY, 44100, 0 };
+    const ALCint attr[] = { ALC_FREQUENCY, AL_MIX_FREQUENCY, 0 };
     al_ctx = alcCreateContext(al_dev, attr);
   }
 
@@ -248,8 +252,8 @@ ALCcontext *alcCreateContextHook(ALCdevice *dev, const ALCint *unused) {
     pthread_mutex_unlock(&al_lock);
     return al_ctx;
   }
-  // override 22050hz with 44100hz in case someone wants high quality sounds
-  const ALCint attr[] = { ALC_FREQUENCY, 44100, 0 };
+  // mix at the Switch output rate so SDL does not resample the final mix
+  const ALCint attr[] = { ALC_FREQUENCY, AL_MIX_FREQUENCY, 0 };
   al_dev = dev;
   al_ctx = alcCreateContext(dev, attr); // capture context for later deinit
   pthread_mutex_unlock(&al_lock);
@@ -555,6 +559,31 @@ ALboolean alIsFilterHook(ALuint filter) {
   ALboolean ret = alIsFilter(filter);
   pthread_mutex_unlock(&al_lock);
   return ret;
+}
+
+// Writes alsoft.conf next to the .nro and points OpenAL Soft at it. Must run
+// before the game opens the audio device.
+void openal_write_config(void) {
+  static const char *resamplers[] = {"point", "linear", "cubic"};
+  int quality = config.audio_quality;
+  FILE *f;
+
+  if (quality < 0)
+    quality = 0;
+  if (quality > 2)
+    quality = 2;
+
+  f = fopen("alsoft.conf", "w");
+  if (!f)
+    return;
+  fprintf(f, "[general]\n");
+  fprintf(f, "frequency = %d\n", AL_MIX_FREQUENCY);
+  fprintf(f, "resampler = %s\n", resamplers[quality]);
+  fprintf(f, "hrtf = false\n");
+  fclose(f);
+
+  setenv("ALSOFT_CONF", "alsoft.conf", 1);
+  debugPrintf("openal: alsoft.conf resampler=%s\n", resamplers[quality]);
 }
 
 void patch_openal(void) {

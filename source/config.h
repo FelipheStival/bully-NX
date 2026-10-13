@@ -15,12 +15,17 @@
 // transitions and cutscene setup.
 #define MEMORY_MB 1024
 
+// Address space kept for the mapped libBully.so image. Everything else in the
+// process heap goes to newlib, since the game, Mesa and OpenAL all allocate
+// from there and a fixed 1 GB cap ran out during long sessions/missions.
+#define SO_HEAP_RESERVE_MB 128
+
 #define SO_NAME "libBully.so"
 #define CONFIG_NAME "config.txt"
 #define LOG_NAME "debug.log"
 
+// Compile-time: mirror log output to stdout/nxlink (development builds only).
 #define DEBUG_LOG 0
-#define DEBUG_FILE_LOG 0
 
 // actual screen size
 extern int screen_width;
@@ -33,7 +38,16 @@ typedef struct {
   int shadows;
   int trilinear_filter;
   int disable_mipmaps;
+  int nintendo_button_glyphs;
   int timing_workaround_ms;
+  int debug_log;
+  int shader_cache;
+  int cpu_boost;
+  int gl_thread;
+  int audio_quality;
+  int phone_mode;
+  int anisotropy;
+  char gl_driver[0x20];
   char mod_file[0x100];
 } Config;
 

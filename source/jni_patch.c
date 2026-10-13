@@ -24,6 +24,8 @@
 #include "hooks.h"
 #include "util.h"
 
+void loading_boost_update(void);
+
 enum MethodIDs
 {
   UNKNOWN = 0,
@@ -182,6 +184,29 @@ static float jni_gamepad_deadzone(float val)
   return val;
 }
 
+static float jni_left_stick_axis(float val)
+{
+  const float android_deadzone = 0.22f;
+  const float android_range = 1.0f - android_deadzone;
+  const float outer_margin = 1.03f;
+  float magnitude;
+
+  val = jni_gamepad_deadzone(val);
+  if (val == 0.0f)
+    return 0.0f;
+
+  /*
+   * Bully applies its own 22% per-axis deadzone after the JNI callback. Feed
+   * the left stick through that active range so the game receives the full
+   * Switch axis again. A small outer margin keeps cardinal directions above
+   * the run threshold. The right stick stays untouched for native camera feel.
+   */
+  magnitude = android_deadzone + android_range * outer_margin * fabsf(val);
+  if (magnitude > 1.0f)
+    magnitude = 1.0f;
+  return val < 0.0f ? -magnitude : magnitude;
+}
+
 static void jni_gamepad_update(void)
 {
   if (!g_jni_pad_initialized)
@@ -226,8 +251,8 @@ static void jni_gamepad_sample(int *connected_out, u64 *buttons_out, float axes_
 
   if (axes_out)
   {
-    axes_out[0] = jni_gamepad_deadzone((float)left.x * scale);
-    axes_out[1] = jni_gamepad_deadzone((float)left.y * -scale);
+    axes_out[0] = jni_left_stick_axis((float)left.x * scale);
+    axes_out[1] = jni_left_stick_axis((float)left.y * -scale);
     axes_out[2] = jni_gamepad_deadzone((float)right.x * scale);
     axes_out[3] = jni_gamepad_deadzone((float)right.y * -scale);
     axes_out[4] = (buttons & HidNpadButton_ZL) ? 1.0f : 0.0f;
@@ -377,8 +402,8 @@ static void sdl_gamepad_sample(int *connected_out, int *buttons_out, float axes_
 
     if (axes_out)
     {
-      axes_out[0] = jni_gamepad_deadzone((float)SDL_GameControllerGetAxis(g_sdl_gamepad, SDL_CONTROLLER_AXIS_LEFTX) * axis_scale);
-      axes_out[1] = jni_gamepad_deadzone((float)-SDL_GameControllerGetAxis(g_sdl_gamepad, SDL_CONTROLLER_AXIS_LEFTY) * axis_scale);
+      axes_out[0] = jni_left_stick_axis((float)SDL_GameControllerGetAxis(g_sdl_gamepad, SDL_CONTROLLER_AXIS_LEFTX) * axis_scale);
+      axes_out[1] = jni_left_stick_axis((float)-SDL_GameControllerGetAxis(g_sdl_gamepad, SDL_CONTROLLER_AXIS_LEFTY) * axis_scale);
       axes_out[2] = jni_gamepad_deadzone((float)SDL_GameControllerGetAxis(g_sdl_gamepad, SDL_CONTROLLER_AXIS_RIGHTX) * axis_scale);
       axes_out[3] = jni_gamepad_deadzone((float)-SDL_GameControllerGetAxis(g_sdl_gamepad, SDL_CONTROLLER_AXIS_RIGHTY) * axis_scale);
       axes_out[4] = (float)SDL_GameControllerGetAxis(g_sdl_gamepad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) / 32767.0f;
@@ -922,7 +947,7 @@ int jni_async_file_pump(double delta_hint)
     return 0;
   }
 
-  now_ns = armGetSystemTick() * 1000000000ULL / armGetSystemTickFreq();
+  now_ns = armTicksToNs(armGetSystemTick());
   delta = delta_hint;
   if (g_async_last_pump_ns == 0)
     g_async_last_pump_ns = now_ns;
@@ -1002,24 +1027,49 @@ static const JniLibGamepadStateMap g_jni_lib_gamepad_buttons[] = {
 
 static void jni_gamepad_sync_lib_state(int connected, u64 buttons)
 {
+  // entries 0/1 are L/R; a lone new press is held back one frame (pending)
   static u64 prev_buttons = 0;
+  static int pending[2] = {0, 0};
+  const int was_pending[2] = {pending[0], pending[1]};
+  int raw[2];
   unsigned i;
 
   if (!g_jni_lib_gamepad_state)
     return;
 
-  for (i = 0; i < sizeof(g_jni_lib_gamepad_buttons) / sizeof(g_jni_lib_gamepad_buttons[0]); i++)
+  for (i = 0; i < 2; i++)
   {
     u64 bit = g_jni_lib_gamepad_buttons[i].nx_mask;
-    int value = 0;
-
+    raw[i] = 0;
     if (connected && (buttons & bit))
-      value = (prev_buttons & bit) ? 3 : 2;
+      raw[i] = (prev_buttons & bit) ? 3 : 2;
+  }
+
+  // L+R chords (Music/Chemistry classes) need both shoulders reported as new
+  // presses in the same frame, but real presses often land on adjacent frames.
+  // Delay a lone shoulder press by one frame so a partner press arriving next
+  // frame is reported together with it; each press is still reported once.
+  for (i = 0; i < 2; i++)
+  {
+    const unsigned other = 1 - i;
+    int value = raw[i];
+
+    if (was_pending[i])
+    {
+      value = 2;
+      pending[i] = 0;
+    }
+    else if (raw[i] == 2 && raw[other] != 2 && !was_pending[other])
+    {
+      value = 0;
+      pending[i] = 1;
+    }
 
     g_jni_lib_gamepad_state[g_jni_lib_gamepad_buttons[i].lib_index] = value;
   }
 
-  g_jni_lib_gamepad_state[12] = 0;
+  // State 12 (L3, look back) is left to the callback/button-mask paths so a
+  // held L3 stays held; clearing it every frame made it a momentary press.
   g_jni_lib_gamepad_state[13] = 0;
 
   prev_buttons = connected ? buttons : 0;
@@ -1350,14 +1400,14 @@ void jni_start(void)
   int rockstar_gate_fired = 0;
   int forced_gamestate = 0;
   int audio_runtime_enabled = 0;
-  int compat_auto = (config.timing_workaround_ms <= 0);
-  int compat_delay_ms = compat_auto ? 0 : config.timing_workaround_ms;
+  int compat_auto = (config.timing_workaround_ms == 0);
+  int compat_delay_ms = config.timing_workaround_ms > 0 ? config.timing_workaround_ms : 0;
   int compat_max_delay_ms = 4;
   int last_swap_count = 0;
   uint64_t last_swap_progress_ns = 0;
   uint64_t last_frame_ns = 0;
-  // Use armGetSystemTick for timing: ticks at 19.2 MHz on Switch
-  last_frame_ns = armGetSystemTick() * 1000000000ULL / armGetSystemTickFreq();
+  // armTicksToNs avoids the tick * 1e9 overflow (~16 min of console uptime)
+  last_frame_ns = armTicksToNs(armGetSystemTick());
   last_swap_count = diag_get_swap_count();
   last_swap_progress_ns = last_frame_ns;
 
@@ -1390,7 +1440,7 @@ void jni_start(void)
     }
 
     // Compute delta time in seconds (like Android's ExecutorThread.guardedRun)
-    uint64_t now_ns = armGetSystemTick() * 1000000000ULL / armGetSystemTickFreq();
+    uint64_t now_ns = armTicksToNs(armGetSystemTick());
     float delta = (float)(now_ns - last_frame_ns) / 1000000000.0f;
     if (delta <= 0.0f || delta > 1.0f)
       delta = 0.016f; // clamp to sane range
@@ -1542,9 +1592,10 @@ void jni_start(void)
     if (!g_async_file_thread_started && asyncHead)
       jni_async_file_pump((double)delta);
     saved_implOnDrawFrame(fake_env, NULL, delta);
+    loading_boost_update();
     frame++;
     {
-      uint64_t frame_end_ns = armGetSystemTick() * 1000000000ULL / armGetSystemTickFreq();
+      uint64_t frame_end_ns = armTicksToNs(armGetSystemTick());
       uint64_t next_frame_ns = last_frame_ns + target_frame_ns;
       if (frame_end_ns < next_frame_ns)
         svcSleepThread((int64_t)(next_frame_ns - frame_end_ns));

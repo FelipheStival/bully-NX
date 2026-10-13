@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -62,6 +65,38 @@ int NVEventEGLInit(void)
 
   NWindow *win = nwindowGetDefault();
 
+  // Mesa 26 for Switch can run GL on nvc0 (native) or zink (over NVK).
+  if (config.gl_driver[0] && strcmp(config.gl_driver, "auto") != 0)
+    setenv("MESA_SWITCH_GL_DRIVER", config.gl_driver, 1);
+  // glthread moves driver work to its own thread. egl-switch enables it by
+  // default, but the engine hands the context between threads, so it stays an
+  // opt-in (gl_thread 1) until it has been played through.
+  setenv("MESA_GLTHREAD", config.gl_thread ? "true" : "false", 1);
+  setenv("MESA_SWITCH_GLTHREAD", config.gl_thread ? "1" : "0", 1);
+  debugPrintf("EGL: gl_thread=%d\n", config.gl_thread);
+  // keep more freed GPU buffers for reuse (default 128 MB) so area transitions
+  // recycle instead of reallocating; the heap has ~3 GB to spare
+  setenv("NOUVEAU_HORIZON_BO_CACHE_MB", "256", 0);
+  // Mesa keeps compiled shaders on disk when it has somewhere to put them; the
+  // Switch has no HOME, so point it next to the .nro. Later runs then skip the
+  // shader compiles that cause hitches the first time a scene is seen.
+  if (config.shader_cache)
+  {
+    char cache_dir[PATH_MAX];
+    if (getcwd(cache_dir, sizeof(cache_dir) - 16))
+    {
+      strcat(cache_dir, "/shader_cache");
+      mkdir(cache_dir, 0777);
+      setenv("MESA_SHADER_CACHE_DIR", cache_dir, 1);
+      debugPrintf("EGL: shader cache at %s\n", cache_dir);
+    }
+  }
+  else
+  {
+    setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
+  }
+  debugPrintf("EGL: gl_driver=%s\n", config.gl_driver[0] ? config.gl_driver : "(auto)");
+
   nwindowSetDimensions(win, screen_width, screen_height);
 
   display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -104,6 +139,8 @@ int NVEventEGLInit(void)
   if (eglSwapInterval(display, 1) == EGL_FALSE)
     debugPrintf("EGL: Could not set swap interval: %08x\n", eglGetError());
 
+  debugPrintf("GL_RENDERER: %s\n", glGetString(GL_RENDERER));
+  debugPrintf("GL_VERSION: %s\n", glGetString(GL_VERSION));
   debugPrintf("GL_EXTENSIONS: %s\n", glGetString(GL_EXTENSIONS));
 
   return 1; // success

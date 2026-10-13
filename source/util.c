@@ -20,7 +20,7 @@
 static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t s_main_thread;
 static int s_main_thread_set = 0;
-static int s_compat_delay_ms = 2;
+static int s_compat_delay_ms = 0;
 
 void debugPrintf_setMainThread(void)
 {
@@ -37,7 +37,9 @@ void debugPrintf_setCompatDelayMs(int ms)
   s_compat_delay_ms = ms;
 }
 
-#ifdef DEBUG_LOG
+static FILE *s_log_file = NULL;
+
+#if DEBUG_LOG
 
 static int s_nxlinkSock = -1;
 
@@ -72,44 +74,75 @@ void userAppExit(void)
 
 #endif
 
+void debugPrintf_setFileLog(int enabled)
+{
+  pthread_mutex_lock(&s_log_mutex);
+  if (enabled && !s_log_file)
+  {
+    s_log_file = fopen(LOG_NAME, "w");
+    if (s_log_file)
+      setvbuf(s_log_file, NULL, _IOLBF, 0x1000);
+  }
+  else if (!enabled && s_log_file)
+  {
+    fclose(s_log_file);
+    s_log_file = NULL;
+  }
+  pthread_mutex_unlock(&s_log_mutex);
+}
+
+int debugPrintf_enabled(void)
+{
+  return DEBUG_LOG || s_log_file != NULL;
+}
+
 int debugPrintf(const char *text, ...)
 {
-#ifdef DEBUG_LOG
   va_list list;
   const char *tag = "?";
+
+  if (!debugPrintf_enabled())
+  {
+    // Logging used to be compiled in unconditionally, and its serialization is
+    // currently masking a startup/gameplay race in the port. Keep the timing
+    // workaround (lock + short sleep) without paying for formatting/output.
+    if (s_compat_delay_ms > 0)
+    {
+      pthread_mutex_lock(&s_log_mutex);
+      svcSleepThread((int64_t)s_compat_delay_ms * 1000000LL);
+      pthread_mutex_unlock(&s_log_mutex);
+    }
+    return 0;
+  }
+
   if (s_main_thread_set)
     tag = pthread_equal(pthread_self(), s_main_thread) ? "M" : "G";
 
   pthread_mutex_lock(&s_log_mutex);
 
-#if DEBUG_FILE_LOG
-  FILE *f = fopen(LOG_NAME, "a");
-  if (f)
+  if (s_log_file)
   {
-    fprintf(f, "[%s] ", tag);
+    fprintf(s_log_file, "[%s] ", tag);
     va_start(list, text);
-    vfprintf(f, text, list);
+    vfprintf(s_log_file, text, list);
     va_end(list);
-    fclose(f);
+    // flush every line so the tail survives a crash
+    fflush(s_log_file);
   }
-#endif
 
+#if DEBUG_LOG
   printf("[%s] ", tag);
   va_start(list, text);
   vprintf(text, list);
   va_end(list);
-
-#if !DEBUG_FILE_LOG
-  // DEBUG_FILE_LOG=1 keeps this mutex held much longer because every log line
-  // does synchronous file I/O. That extra serialization is currently masking a
-  // startup/gameplay race in the port, so emulate a small portion of that
-  // delay without actually writing debug.log.
-  if (s_compat_delay_ms > 0)
-    svcSleepThread((int64_t)s_compat_delay_ms * 1000000LL);
 #endif
+
+  // File logging already serializes callers on real I/O; otherwise emulate a
+  // small portion of that delay (see above).
+  if (!s_log_file && s_compat_delay_ms > 0)
+    svcSleepThread((int64_t)s_compat_delay_ms * 1000000LL);
 
   pthread_mutex_unlock(&s_log_mutex);
-#endif
   return 0;
 }
 

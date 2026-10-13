@@ -8,16 +8,34 @@
 
 #include "asset_archive.h"
 
+#include <switch.h>
+#include <dirent.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>
 
+#include "config.h"
 #include "util.h"
 
 #define ASSET_ROOT "assets/"
 #define IMG_BLOCK_SIZE 2048u
 #define HANDLE_MAGIC 0x4153484Eu
+#define SLICE_CACHE_SIZE (64u * 1024u)
+#define MAX_SHARED_ZIPS 8
+#define LOOSE_SCAN_MAX 16384
+#define LOOSE_SCAN_DEPTH 8
+
+// open-addressing hash index over an array of paths; slots hold index + 1
+typedef struct
+{
+  uint32_t *slots;
+  size_t mask;
+} PathIndex;
+
+typedef const char *(*PathKeyFn)(const void *ctx, size_t i);
 
 typedef struct
 {
@@ -44,6 +62,7 @@ typedef struct
   uint32_t img_size;
   ImgDirEntry *entries;
   size_t entry_count;
+  PathIndex index;
 } ImgPack;
 
 typedef enum
@@ -57,14 +76,37 @@ typedef struct
   uint32_t magic;
   AssetHandleKind kind;
   FILE *fp;
+  FsFile *zf; // shared zip file for slices; NULL falls back to fp
   long start;
   long size;
   long pos;
+  unsigned char *cache;
+  long cache_pos;
+  size_t cache_len;
 } AssetHandle;
+
+typedef struct
+{
+  char name[16];
+  FsFile file;
+  int state; // 0 = unopened, 1 = open, -1 = failed
+} SharedZip;
 
 static ZipIndexEntry *g_zip_entries;
 static size_t g_zip_entry_count;
 static size_t g_zip_entry_cap;
+static PathIndex g_zip_index;
+
+static SharedZip g_shared_zips[MAX_SHARED_ZIPS];
+static pthread_mutex_t g_shared_zip_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// every file present under assets/ (data archives included); when the scan
+// succeeds, only these paths are probed with fopen
+static char **g_loose_paths;
+static size_t g_loose_count;
+static size_t g_loose_cap;
+static PathIndex g_loose_index;
+static int g_loose_indexed;
 
 static ImgPack g_img_packs[] = {
     {"act/", "bullyorig/act/act.dir", "bullyorig/act/act.img", "", 0, 0, NULL, 0},
@@ -126,6 +168,85 @@ static void normalize_path(char *dst, size_t dst_size, const char *src)
   }
 
   dst[j] = '\0';
+}
+
+static uint32_t path_hash(const char *s)
+{
+  uint32_t h = 2166136261u;
+  while (*s)
+  {
+    h ^= (unsigned char)*s++;
+    h *= 16777619u;
+  }
+  return h;
+}
+
+static int path_index_build(PathIndex *idx, size_t count, PathKeyFn key_at, const void *ctx)
+{
+  size_t cap = 16;
+  size_t i;
+
+  while (cap < count * 2)
+    cap <<= 1;
+
+  idx->slots = calloc(cap, sizeof(*idx->slots));
+  if (!idx->slots)
+  {
+    idx->mask = 0;
+    return -1;
+  }
+  idx->mask = cap - 1;
+
+  for (i = 0; i < count; i++)
+  {
+    const char *key = key_at(ctx, i);
+    size_t slot = path_hash(key) & idx->mask;
+
+    // keep the first occurrence, matching the old linear lookup order
+    while (idx->slots[slot] && strcmp(key_at(ctx, idx->slots[slot] - 1), key) != 0)
+      slot = (slot + 1) & idx->mask;
+    if (!idx->slots[slot])
+      idx->slots[slot] = (uint32_t)(i + 1);
+  }
+
+  return 0;
+}
+
+// returns the entry index, -1 if missing, -2 if there is no index
+static long path_index_find(const PathIndex *idx, const char *key, PathKeyFn key_at, const void *ctx)
+{
+  size_t slot;
+
+  if (!idx->slots)
+    return -2;
+
+  slot = path_hash(key) & idx->mask;
+  while (idx->slots[slot])
+  {
+    uint32_t i = idx->slots[slot] - 1;
+    if (strcmp(key_at(ctx, i), key) == 0)
+      return (long)i;
+    slot = (slot + 1) & idx->mask;
+  }
+
+  return -1;
+}
+
+static const char *zip_entry_key(const void *ctx, size_t i)
+{
+  (void)ctx;
+  return g_zip_entries[i].path;
+}
+
+static const char *img_entry_key(const void *ctx, size_t i)
+{
+  return ((const ImgPack *)ctx)->entries[i].name;
+}
+
+static const char *loose_path_key(const void *ctx, size_t i)
+{
+  (void)ctx;
+  return g_loose_paths[i];
 }
 
 static const char *path_basename(const char *path)
@@ -266,12 +387,45 @@ static int load_zip_index_file(const char *idx_name)
 static const ZipIndexEntry *find_zip_entry(const char *normalized_path)
 {
   size_t i;
+  long found = path_index_find(&g_zip_index, normalized_path, zip_entry_key, NULL);
+
+  if (found >= 0)
+    return &g_zip_entries[found];
+  if (found == -1)
+    return NULL;
   for (i = 0; i < g_zip_entry_count; i++)
   {
     if (strcmp(g_zip_entries[i].path, normalized_path) == 0)
       return &g_zip_entries[i];
   }
   return NULL;
+}
+
+// Swap the A/B and X/Y prompt textures so button tips match the Nintendo layout.
+static const char *remap_nintendo_button_glyph(const char *normalized_path)
+{
+  const char *name = normalized_path;
+  int has_bully_prefix = 0;
+
+  if (!config.nintendo_button_glyphs)
+    return normalized_path;
+
+  if (strncmp(name, "bully/", 6) == 0)
+  {
+    has_bully_prefix = 1;
+    name += 6;
+  }
+
+  if (strcmp(name, "hud_button_a.tex") == 0)
+    return has_bully_prefix ? "bully/hud_button_b.tex" : "hud_button_b.tex";
+  if (strcmp(name, "hud_button_b.tex") == 0)
+    return has_bully_prefix ? "bully/hud_button_a.tex" : "hud_button_a.tex";
+  if (strcmp(name, "hud_button_x.tex") == 0)
+    return has_bully_prefix ? "bully/hud_button_y.tex" : "hud_button_y.tex";
+  if (strcmp(name, "hud_button_y.tex") == 0)
+    return has_bully_prefix ? "bully/hud_button_x.tex" : "hud_button_x.tex";
+
+  return normalized_path;
 }
 
 static AssetHandle *asset_handle_from_file(FILE *fp)
@@ -291,27 +445,83 @@ static AssetHandle *asset_handle_from_file(FILE *fp)
   return handle;
 }
 
+// Opens each data archive once and shares it between handles. fsFileRead takes
+// an explicit offset, so concurrent readers need no seek or lock.
+static FsFile *shared_zip_get(const char *zip_name)
+{
+  FsFile *ret = NULL;
+  int i;
+
+  pthread_mutex_lock(&g_shared_zip_lock);
+
+  for (i = 0; i < MAX_SHARED_ZIPS; i++)
+  {
+    if (g_shared_zips[i].state != 0 && strcmp(g_shared_zips[i].name, zip_name) == 0)
+    {
+      ret = (g_shared_zips[i].state > 0) ? &g_shared_zips[i].file : NULL;
+      goto out;
+    }
+  }
+
+  for (i = 0; i < MAX_SHARED_ZIPS; i++)
+  {
+    char fullpath[128];
+    char fspath[FS_MAX_PATH];
+    FsFileSystem *fs = NULL;
+    SharedZip *zip = &g_shared_zips[i];
+
+    if (zip->state != 0)
+      continue;
+
+    snprintf(zip->name, sizeof(zip->name), "%s", zip_name);
+    snprintf(fullpath, sizeof(fullpath), ASSET_ROOT "%s", zip_name);
+    if (fsdevTranslatePath(fullpath, &fs, fspath) != -1 &&
+        R_SUCCEEDED(fsFsOpenFile(fs, fspath, FsOpenMode_Read, &zip->file)))
+    {
+      zip->state = 1;
+      ret = &zip->file;
+    }
+    else
+    {
+      zip->state = -1;
+      debugPrintf("asset_archive: shared open failed for %s, using stdio\n", fullpath);
+    }
+    break;
+  }
+
+out:
+  pthread_mutex_unlock(&g_shared_zip_lock);
+  return ret;
+}
+
 static AssetHandle *asset_handle_from_slice(const char *zip_name, uint32_t start, uint32_t size)
 {
   char fullpath[128];
-  FILE *fp;
+  FILE *fp = NULL;
+  FsFile *zf;
   AssetHandle *handle;
 
-  snprintf(fullpath, sizeof(fullpath), ASSET_ROOT "%s", zip_name);
-  fp = fopen(fullpath, "rb");
-  if (!fp)
-    return NULL;
+  zf = shared_zip_get(zip_name);
+  if (!zf)
+  {
+    snprintf(fullpath, sizeof(fullpath), ASSET_ROOT "%s", zip_name);
+    fp = fopen(fullpath, "rb");
+    if (!fp)
+      return NULL;
+  }
 
   handle = calloc(1, sizeof(*handle));
   if (!handle)
   {
-    fclose(fp);
+    if (fp)
+      fclose(fp);
     return NULL;
   }
 
   handle->magic = HANDLE_MAGIC;
   handle->kind = ASSET_HANDLE_SLICE;
   handle->fp = fp;
+  handle->zf = zf;
   handle->start = (long)start;
   handle->size = (long)size;
   handle->pos = 0;
@@ -378,7 +588,118 @@ static int load_img_pack(ImgPack *pack)
   }
 
   free(dir_data);
+  path_index_build(&pack->index, pack->entry_count, img_entry_key, pack);
   return 0;
+}
+
+static int add_loose_path(const char *path)
+{
+  char *copy;
+
+  if (g_loose_count >= LOOSE_SCAN_MAX)
+    return -1;
+
+  if (g_loose_count == g_loose_cap)
+  {
+    size_t new_cap = g_loose_cap ? g_loose_cap * 2 : 64;
+    char **new_paths = realloc(g_loose_paths, new_cap * sizeof(*new_paths));
+    if (!new_paths)
+      return -1;
+    g_loose_paths = new_paths;
+    g_loose_cap = new_cap;
+  }
+
+  copy = strdup(path);
+  if (!copy)
+    return -1;
+  g_loose_paths[g_loose_count++] = copy;
+  return 0;
+}
+
+// rel is relative to ASSET_ROOT and either empty or ends with '/'
+static int scan_loose_dir(const char *rel, int depth)
+{
+  char dirpath[640];
+  DIR *dir;
+  struct dirent *de;
+  int ret = 0;
+
+  snprintf(dirpath, sizeof(dirpath), ASSET_ROOT "%s", rel);
+  dir = opendir(dirpath);
+  if (!dir)
+    return -1;
+
+  while (ret == 0 && (de = readdir(dir)) != NULL)
+  {
+    char child[512];
+    int is_dir;
+
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+      continue;
+
+    if (de->d_type == DT_UNKNOWN)
+    {
+      struct stat st;
+      char full[1024];
+      snprintf(full, sizeof(full), "%s%s", dirpath, de->d_name);
+      if (stat(full, &st) < 0)
+        continue;
+      is_dir = S_ISDIR(st.st_mode);
+    }
+    else
+    {
+      is_dir = (de->d_type == DT_DIR);
+    }
+
+    if (is_dir)
+    {
+      if (depth >= LOOSE_SCAN_DEPTH)
+        ret = -1;
+      else
+      {
+        snprintf(child, sizeof(child), "%s%s/", rel, de->d_name);
+        ret = scan_loose_dir(child, depth + 1);
+      }
+      continue;
+    }
+
+    // the data_*.zip archives stay in the index: the game opens them through
+    // asset_open too, and a miss here returns NULL without trying fopen
+
+    {
+      char normalized[512];
+      snprintf(child, sizeof(child), "%s%s", rel, de->d_name);
+      normalize_path(normalized, sizeof(normalized), child);
+      ret = add_loose_path(normalized);
+    }
+  }
+
+  closedir(dir);
+  return ret;
+}
+
+static void index_loose_files(void)
+{
+  size_t i;
+
+  if (scan_loose_dir("", 0) == 0 &&
+      path_index_build(&g_loose_index, g_loose_count, loose_path_key, NULL) == 0)
+  {
+    g_loose_indexed = 1;
+    debugPrintf("asset_archive: %zu loose files under " ASSET_ROOT "\n", g_loose_count);
+    return;
+  }
+
+  // scan failed or too many files: always probe the filesystem as before
+  for (i = 0; i < g_loose_count; i++)
+    free(g_loose_paths[i]);
+  free(g_loose_paths);
+  g_loose_paths = NULL;
+  g_loose_count = g_loose_cap = 0;
+  free(g_loose_index.slots);
+  g_loose_index.slots = NULL;
+  g_loose_indexed = 0;
+  debugPrintf("asset_archive: loose file scan unavailable, probing every open\n");
 }
 
 int asset_archive_init(void)
@@ -392,6 +713,8 @@ int asset_archive_init(void)
 
   for (i = 0; i < sizeof(g_idx_files) / sizeof(g_idx_files[0]); i++)
     load_zip_index_file(g_idx_files[i]);
+  path_index_build(&g_zip_index, g_zip_entry_count, zip_entry_key, NULL);
+  index_loose_files();
 
   for (i = 0; i < sizeof(g_img_packs) / sizeof(g_img_packs[0]); i++)
     load_img_pack(&g_img_packs[i]);
@@ -416,6 +739,10 @@ static AssetHandle *open_loose_asset(const char *path, const char *normalized_pa
   char fullpath[768];
   FILE *fp;
 
+  if (g_loose_indexed &&
+      path_index_find(&g_loose_index, normalized_path, loose_path_key, NULL) < 0)
+    return NULL;
+
   snprintf(fullpath, sizeof(fullpath), ASSET_ROOT "%s", path);
   fp = fopen(fullpath, "rb");
   if (fp)
@@ -434,7 +761,8 @@ static AssetHandle *open_loose_asset(const char *path, const char *normalized_pa
 
 static AssetHandle *open_zip_asset(const char *normalized_path)
 {
-  const ZipIndexEntry *entry = find_zip_entry(normalized_path);
+  const char *lookup_path = remap_nintendo_button_glyph(normalized_path);
+  const ZipIndexEntry *entry = find_zip_entry(lookup_path);
   if (!entry)
     return NULL;
 
@@ -444,6 +772,12 @@ static AssetHandle *open_zip_asset(const char *normalized_path)
 static const ImgDirEntry *find_img_entry(const ImgPack *pack, const char *name)
 {
   size_t i;
+  long found = path_index_find(&pack->index, name, img_entry_key, pack);
+
+  if (found >= 0)
+    return &pack->entries[found];
+  if (found == -1)
+    return NULL;
   for (i = 0; i < pack->entry_count; i++)
   {
     if (strcmp(pack->entries[i].name, name) == 0)
@@ -474,7 +808,8 @@ static AssetHandle *open_img_pack_asset(const char *path, const char *normalized
     if (!entry)
       return NULL;
 
-    debugPrintf("asset_archive: %s -> %s!%s [%u blocks @ %u]\n",
+    if (debugPrintf_enabled())
+      debugPrintf("asset_archive: %s -> %s!%s [%u blocks @ %u]\n",
                 path,
                 pack->zip_name,
                 pack->img_path,
@@ -505,7 +840,8 @@ static AssetHandle *open_img_pack_asset(const char *path, const char *normalized
   if (!fallback_pack || !fallback_entry)
     return NULL;
 
-  debugPrintf("asset_archive: %s -> %s!%s [%u blocks @ %u] (basename fallback)\n",
+  if (debugPrintf_enabled())
+    debugPrintf("asset_archive: %s -> %s!%s [%u blocks @ %u] (basename fallback)\n",
               path,
               fallback_pack->zip_name,
               fallback_pack->img_path,
@@ -549,7 +885,65 @@ void asset_close(void *opaque)
     return;
   if (handle->fp)
     fclose(handle->fp);
+  free(handle->cache);
   free(handle);
+}
+
+static size_t slice_read_shared(AssetHandle *handle, unsigned char *dst, size_t want)
+{
+  size_t done = 0;
+
+  while (done < want)
+  {
+    const long pos = handle->pos;
+    const size_t left = want - done;
+    u64 got = 0;
+
+    if (handle->cache_len && pos >= handle->cache_pos &&
+        pos < handle->cache_pos + (long)handle->cache_len)
+    {
+      size_t off = (size_t)(pos - handle->cache_pos);
+      size_t n = handle->cache_len - off;
+      if (n > left)
+        n = left;
+      memcpy(dst + done, handle->cache + off, n);
+      handle->pos += (long)n;
+      done += n;
+      continue;
+    }
+
+    if (!handle->cache && left < SLICE_CACHE_SIZE)
+      handle->cache = malloc(SLICE_CACHE_SIZE);
+
+    if (left >= SLICE_CACHE_SIZE || !handle->cache)
+    {
+      // large reads go straight into the caller's buffer
+      if (R_FAILED(fsFileRead(handle->zf, handle->start + pos, dst + done, left,
+                              FsReadOption_None, &got)) || got == 0)
+        break;
+      handle->pos += (long)got;
+      done += (size_t)got;
+      if (got < left)
+        break;
+      continue;
+    }
+
+    {
+      size_t fill = SLICE_CACHE_SIZE;
+      if ((long)fill > handle->size - pos)
+        fill = (size_t)(handle->size - pos);
+      if (R_FAILED(fsFileRead(handle->zf, handle->start + pos, handle->cache, fill,
+                              FsReadOption_None, &got)) || got == 0)
+      {
+        handle->cache_len = 0;
+        break;
+      }
+      handle->cache_pos = pos;
+      handle->cache_len = (size_t)got;
+    }
+  }
+
+  return done;
 }
 
 size_t asset_read(void *buf, size_t size, size_t nmemb, void *opaque)
@@ -570,6 +964,9 @@ size_t asset_read(void *buf, size_t size, size_t nmemb, void *opaque)
     size_t total = size * nmemb;
     size_t to_read = (size_t)((remaining < (long)total) ? remaining : (long)total);
     size_t bytes_read;
+
+    if (handle->zf)
+      return slice_read_shared(handle, (unsigned char *)buf, to_read) / size;
 
     if (fseek(handle->fp, handle->start + handle->pos, SEEK_SET) != 0)
       return 0;

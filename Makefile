@@ -39,7 +39,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	Bully
-APP_VERSION :=  0.0.2
+APP_VERSION :=  0.0.3
 APP_AUTHOR  :=  givethesourceplox
 BUILD		:=	build
 SOURCES		:=	source source/hooks
